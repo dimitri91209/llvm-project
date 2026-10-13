@@ -5713,6 +5713,7 @@ td_library(
         ":FunctionInterfacesTdFiles",
         ":InferIntRangeInterfaceTdFiles",
         ":LLVMOpsTdFiles",
+        ":LoopLikeInterfaceTdFiles",
         ":OpBaseTdFiles",
         ":SCFTdFiles",
         ":SideEffectInterfacesTdFiles",
@@ -5806,6 +5807,7 @@ cc_library(
         ":InferIntRangeInterface",
         ":InferTypeOpInterface",
         ":InliningUtils",
+        ":LoopLikeInterface",
         ":MathDialect",
         ":MemRefDialect",
         ":SCFDialect",
@@ -10966,6 +10968,7 @@ td_library(
     deps = [
         ":AtomicInterfacesTdFiles",
         ":LLVMOpsTdFiles",
+        ":LoopLikeInterfaceTdFiles",
         ":OpBaseTdFiles",
     ],
 )
@@ -11060,6 +11063,7 @@ cc_library(
         ":FuncDialect",
         ":IR",
         ":LLVMDialect",
+        ":LoopLikeInterface",
         ":OpenACCMPOpsInterfacesIncGen",
         ":OpenMPInterfacesIncGen",
         ":OpenMPOpsIncGen",
