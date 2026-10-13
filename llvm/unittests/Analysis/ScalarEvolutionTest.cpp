@@ -74,6 +74,12 @@ static std::optional<APInt> computeConstantDifference(ScalarEvolution &SE,
       const SCEV *FoundRHS) {
     return SE.isImpliedCond(Pred, LHS, RHS, FoundPred, FoundLHS, FoundRHS);
   }
+
+  static bool isKnownOnEveryIteration(ScalarEvolution &SE, CmpPredicate Pred,
+                                      const SCEV *LHS, const SCEV *RHS,
+                                      const Loop *L) {
+    return SE.isKnownOnEveryIteration(Pred, LHS, RHS, L);
+  }
 };
 
 TEST_F(ScalarEvolutionsTest, SCEVUnknownRAUW) {
@@ -1757,6 +1763,261 @@ TEST_F(ScalarEvolutionsTest, GuardedStartNonNegative) {
                                                    Start, Zero));
     EXPECT_FALSE(SE.isKnownPredicateAt(ICmpInst::ICMP_SGE, Start, Zero,
                                        Loop->getTerminator()));
+  });
+}
+
+// A predicate that can only change from false to true as the loop iterates
+// holds on every iteration if it holds on loop entry.
+TEST_F(ScalarEvolutionsTest, KnownOnEveryIterationMonotonic) {
+  LLVMContext C;
+  SMDiagnostic Err;
+  // In each loop the start value is known only from the guard, and the latch
+  // bounds the IV from above only. Each IV is in its own loop, so that the
+  // IVs are distinct SCEVs with exactly the flags written here.
+  std::unique_ptr<Module> M = parseAssemblyString(
+      "define void @nsw(i32 %s, i32 %n, i32 %inv) { "
+      "entry: "
+      "  %g = icmp sge i32 %s, 0 "
+      "  br i1 %g, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nsw i32 %iv, 1 "
+      "  %var = add i32 %inv, %iv "
+      "  %ec = icmp slt i32 %iv.next, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      "define void @nsw_strict(i32 %s, i32 %n) { "
+      "entry: "
+      "  %g = icmp sgt i32 %s, 0 "
+      "  br i1 %g, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nsw i32 %iv, 1 "
+      "  %ec = icmp slt i32 %iv.next, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      "define void @dec(i32 %s, i32 %n) { "
+      "entry: "
+      "  %g = icmp sge i32 %s, 0 "
+      "  br i1 %g, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nsw i32 %iv, -1 "
+      "  %ec = icmp sgt i32 %iv.next, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      "define void @wrap(i32 %s, i32 %n) { "
+      "entry: "
+      "  %g = icmp sge i32 %s, 0 "
+      "  br i1 %g, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add i32 %iv, 1 "
+      "  %ec = icmp ne i32 %iv.next, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      "define void @unk_step(i32 %s, i32 %n, i32 %step) { "
+      "entry: "
+      "  %g = icmp sge i32 %s, 0 "
+      "  br i1 %g, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nsw i32 %iv, %step "
+      "  %ec = icmp slt i32 %iv.next, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      // An nuw IV, compared with a value that is known to be below it on
+      // entry only via a signed guard.
+      "define void @nuw(i32 %s, i32 %inv, i32 %n) { "
+      "entry: "
+      "  %g = icmp sgt i32 %s, %inv "
+      "  %g.u = icmp ugt i32 %s, %inv "
+      "  %g2 = and i1 %g, %g.u "
+      "  br i1 %g2, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nuw i32 %iv, 1 "
+      "  %ec = icmp ne i32 %iv, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      "define void @nuw_signed_guard(i32 %s, i32 %inv, i32 %n) { "
+      "entry: "
+      "  %g = icmp sgt i32 %s, %inv "
+      "  br i1 %g, label %loop, label %exit "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nuw i32 %iv, 1 "
+      "  %ec = icmp ne i32 %iv, %n "
+      "  br i1 %ec, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      // The latch guarantees iv >=s 0 on the backedge, but nothing is known
+      // on entry.
+      "define void @no_entry(i32 %s) { "
+      "entry: "
+      "  br label %loop "
+      "loop: "
+      "  %iv = phi i32 [ %s, %entry ], [ %iv.next, %loop ] "
+      "  %iv.next = add nsw i32 %iv, 1 "
+      "  %ec = icmp sge i32 %iv.next, 0 "
+      "  %ec2 = icmp slt i32 %iv.next, 100 "
+      "  %ec3 = and i1 %ec, %ec2 "
+      "  br i1 %ec3, label %loop, label %exit "
+      "exit: "
+      "  ret void "
+      "} "
+      // An outer-loop recurrence compared with an inner-loop one.
+      "define void @nest(i32 %s, i32 %n) { "
+      "entry: "
+      "  %g = icmp sge i32 %s, 0 "
+      "  br i1 %g, label %outer, label %exit "
+      "outer: "
+      "  %o = phi i32 [ 0, %entry ], [ %o.next, %outer.latch ] "
+      "  %og = icmp sge i32 %s, %o "
+      "  br i1 %og, label %inner, label %outer.latch "
+      "inner: "
+      "  %i = phi i32 [ %s, %outer ], [ %i.next, %inner ] "
+      "  %i.next = add nsw i32 %i, 1 "
+      "  %iec = icmp slt i32 %i.next, %n "
+      "  br i1 %iec, label %inner, label %outer.latch "
+      "outer.latch: "
+      "  %o.next = add nsw i32 %o, 1 "
+      "  %oec = icmp slt i32 %o.next, %n "
+      "  br i1 %oec, label %outer, label %exit "
+      "exit: "
+      "  ret void "
+      "} ",
+      Err, C);
+
+  ASSERT_TRUE(M && "Could not parse module?");
+  ASSERT_TRUE(!verifyModule(*M) && "Must have been well formed!");
+
+  const auto SGE = ICmpInst::ICMP_SGE, SGT = ICmpInst::ICMP_SGT;
+  const auto SLE = ICmpInst::ICMP_SLE, UGT = ICmpInst::ICMP_UGT;
+  // Runs Check(SE, IV, Loop, Arg) on the IV named "iv" in function Name.
+  auto WithIV = [&](StringRef Name,
+                    function_ref<void(ScalarEvolution &, const SCEV *,
+                                      const Loop *, Function &)>
+                        Check) {
+    runWithSE(*M, Name, [&](Function &F, LoopInfo &LI, ScalarEvolution &SE) {
+      Instruction *IV = getInstructionByName(F, "iv");
+      Check(SE, SE.getSCEV(IV), LI.getLoopFor(IV->getParent()), F);
+    });
+  };
+
+  WithIV("nsw",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &F) {
+           const SCEV *Zero = SE.getZero(IV->getType());
+           const SCEV *MinusOne = SE.getMinusOne(IV->getType());
+           // {s,+,1}<nsw> >=s 0 holds on entry and can only become true.
+           EXPECT_TRUE(isKnownOnEveryIteration(SE, SGE, IV, Zero, L));
+           // The same with the operands swapped.
+           EXPECT_TRUE(isKnownOnEveryIteration(SE, SLE, Zero, IV, L));
+           // The same through the public query.
+           EXPECT_TRUE(SE.isKnownPredicate(SGE, IV, Zero));
+           // {s,+,1}<nsw> <=s -1 can become false.
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SLE, IV, MinusOne, L));
+           // The other side varies in the loop.
+           const SCEV *Var = SE.getSCEV(getInstructionByName(F, "var"));
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, IV, Var, L));
+           // The predicate does not hold on entry.
+           const SCEV *Inv = SE.getSCEV(F.getArg(2));
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, IV, Inv, L));
+         });
+
+  WithIV("nsw_strict",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &) {
+           // A strict predicate: {s,+,1}<nsw> >s 0 with s >s 0 on entry.
+           EXPECT_TRUE(isKnownOnEveryIteration(SE, SGT, IV,
+                                               SE.getZero(IV->getType()), L));
+         });
+
+  WithIV("dec",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &) {
+           // A negative step: {s,+,-1}<nsw> >=s 0 can become false.
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, IV,
+                                                SE.getZero(IV->getType()), L));
+         });
+
+  WithIV("wrap",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &F) {
+           // No nsw or nuw: {s,+,1} may wrap.
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, IV,
+                                                SE.getZero(IV->getType()), L));
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, ICmpInst::ICMP_UGE, IV,
+                                                SE.getSCEV(F.getArg(0)), L));
+         });
+
+  WithIV("unk_step",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &) {
+           // A step of unknown sign.
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, IV,
+                                                SE.getZero(IV->getType()), L));
+         });
+
+  WithIV("nuw",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &F) {
+           const SCEV *Inv = SE.getSCEV(F.getArg(1));
+           // An unsigned predicate with nuw: {s,+,1}<nuw> >u inv.
+           EXPECT_TRUE(isKnownOnEveryIteration(SE, UGT, IV, Inv, L));
+           // The same as samesign: it is monotonic as a plain ugt, and s >u inv
+           // holds on entry.
+           EXPECT_TRUE(isKnownOnEveryIteration(
+               SE, CmpPredicate(UGT, /*HasSameSign=*/true), IV, Inv, L));
+         });
+
+  WithIV("nuw_signed_guard",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &F) {
+           const SCEV *Inv = SE.getSCEV(F.getArg(1));
+           // Only s >s inv is known on entry. As a samesign ugt the predicate
+           // holds on entry, but {s,+,1}<nuw> may become negative while inv is
+           // negative, and then samesign ugt is false: s = 3, inv = -5 at s + i
+           // = INT_MIN.
+           EXPECT_FALSE(isKnownOnEveryIteration(
+               SE, CmpPredicate(UGT, /*HasSameSign=*/true), IV, Inv, L));
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, UGT, IV, Inv, L));
+         });
+
+  WithIV("no_entry",
+         [&](ScalarEvolution &SE, const SCEV *IV, const Loop *L, Function &) {
+           // The backedge proves iv.next >=s 0, but the predicate is not known
+           // on entry.
+           EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, IV,
+                                                SE.getZero(IV->getType()), L));
+         });
+
+  runWithSE(*M, "nest", [&](Function &F, LoopInfo &LI, ScalarEvolution &SE) {
+    const SCEV *I = SE.getSCEV(getInstructionByName(F, "i"));
+    const SCEV *O = SE.getSCEV(getInstructionByName(F, "o"));
+    const Loop *Inner =
+        LI.getLoopFor(getInstructionByName(F, "i")->getParent());
+    const Loop *Outer =
+        LI.getLoopFor(getInstructionByName(F, "o")->getParent());
+    const SCEV *Zero = SE.getZero(I->getType());
+
+    // The inner recurrence against zero, for the inner loop.
+    EXPECT_TRUE(isKnownOnEveryIteration(SE, SGE, I, Zero, Inner));
+    // The recurrence belongs to another loop.
+    EXPECT_FALSE(isKnownOnEveryIteration(SE, SGE, I, Zero, Outer));
+    // The outer recurrence is invariant in the inner loop, and may be on
+    // either side. i >=s o holds on entry to the inner loop from the guard.
+    EXPECT_TRUE(isKnownOnEveryIteration(SE, SGE, I, O, Inner));
+    EXPECT_TRUE(isKnownOnEveryIteration(SE, SLE, O, I, Inner));
+    // Both sides vary in the outer loop.
+    EXPECT_FALSE(isKnownOnEveryIteration(SE, SLE, O, I, Outer));
   });
 }
 
